@@ -11,16 +11,11 @@ from datetime import datetime
 import pandas as pd
 import plotly.graph_objects as go
 
-# ==================== GCJ-02 坐标系转换 ====================
-class CoordConverter:
-    @staticmethod
-    def convert_display_coords(lat, lon, from_type, to_type="WGS-84"):
-        return lat, lon  # 简化版
-
 # ==================== 页面配置 ====================
 st.set_page_config(page_title="无人机智能监控系统", page_icon="🛰️", layout="wide")
 
-CAMPUS_GCJ02 = [32.234097, 118.749413]
+# ==================== 南京科技职业学院坐标 ====================
+CAMPUS = [32.234097, 118.749413]
 OBSTACLE_CONFIG_FILE = "obstacle_config.json"
 WAYPOINT_CONFIG_FILE = "waypoint_config.json"
 
@@ -73,15 +68,18 @@ if 'show_height_panel' not in st.session_state:
 
 # ==================== 保存函数 ====================
 def save_waypoints():
-    data = {'save_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 'point_a': st.session_state.point_a, 'point_b': st.session_state.point_b}
+    data = {'save_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 
+            'point_a': st.session_state.point_a, 
+            'point_b': st.session_state.point_b}
     with open(WAYPOINT_CONFIG_FILE, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 def save_obstacles_to_file():
-    data = {'save_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 'obstacles': st.session_state.obstacles, 'count': len(st.session_state.obstacles)}
+    data = {'save_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 
+            'obstacles': st.session_state.obstacles, 
+            'count': len(st.session_state.obstacles)}
     with open(OBSTACLE_CONFIG_FILE, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
-    return True
 
 def load_obstacles_from_file():
     if os.path.exists(OBSTACLE_CONFIG_FILE):
@@ -90,13 +88,6 @@ def load_obstacles_from_file():
             st.session_state.obstacles = data.get('obstacles', [])
         return True
     return False
-
-def get_config_status():
-    if os.path.exists(OBSTACLE_CONFIG_FILE):
-        with open(OBSTACLE_CONFIG_FILE, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        return {'exists': True, 'count': data.get('count', 0), 'save_time': data.get('save_time', '未知')}
-    return {'exists': False, 'count': 0}
 
 # ==================== 心跳模拟器 ====================
 class HeartbeatSimulator:
@@ -122,14 +113,20 @@ class HeartbeatSimulator:
         elapsed = current - self.last_time
         if elapsed >= 1:
             self.last_time = current
-            heartbeat = {'id': len(self.history) + 1, 'time': datetime.now().strftime("%H:%M:%S"), 'status': 'alive', 'delay': round(random.uniform(5, 50), 2)}
+            heartbeat = {'id': len(self.history) + 1, 
+                        'time': datetime.now().strftime("%H:%M:%S"), 
+                        'status': 'alive', 
+                        'delay': round(random.uniform(5, 50), 2)}
             self.history.append(heartbeat)
             if len(self.history) > 50:
                 self.history.pop(0)
             return heartbeat
         if elapsed > 3 and not self.offline:
             self.offline = True
-            timeout = {'id': len(self.history) + 1, 'time': datetime.now().strftime("%H:%M:%S"), 'status': 'timeout', 'delay': 0}
+            timeout = {'id': len(self.history) + 1, 
+                      'time': datetime.now().strftime("%H:%M:%S"), 
+                      'status': 'timeout', 
+                      'delay': 0}
             self.history.append(timeout)
             return timeout
         elif elapsed <= 3 and self.offline:
@@ -173,6 +170,7 @@ def point_in_polygon(point, poly):
     return inside
 
 def line_intersects_polygon(start, end, poly):
+    """检查线段是否与多边形相交"""
     for t in range(21):
         t = t/20
         lat = start[0] + (end[0]-start[0])*t
@@ -181,20 +179,23 @@ def line_intersects_polygon(start, end, poly):
             return True
     return False
 
+def get_polygon_bounds(points):
+    """获取多边形边界"""
+    lats = [p[0] for p in points]
+    lons = [p[1] for p in points]
+    return min(lats), max(lats), min(lons), max(lons)
+
 # ==================== 障碍物类 ====================
 class Obstacle:
     def __init__(self, points, height, name):
         self.points = points
         self.height = height
         self.name = name
-        lats = [p[0] for p in points]
-        lons = [p[1] for p in points]
-        self.min_lat = min(lats)
-        self.max_lat = max(lats)
-        self.min_lon = min(lons)
-        self.max_lon = max(lons)
+        self.min_lat, self.max_lat, self.min_lon, self.max_lon = get_polygon_bounds(points)
         self.center_lat = (self.min_lat + self.max_lat) / 2
         self.center_lon = (self.min_lon + self.max_lon) / 2
+        self.width_lat = self.max_lat - self.min_lat
+        self.width_lon = self.max_lon - self.min_lon
         
     def to_dict(self):
         return {'points': self.points, 'height': self.height, 'name': self.name}
@@ -206,14 +207,14 @@ class Obstacle:
     def contains(self, point):
         return point_in_polygon(point, self.points)
     
-    def get_bypass_points(self, start, end, safe_radius=5):
-        """获取左右绕行点"""
+    def intersects_line(self, start, end):
+        return line_intersects_polygon(start, end, self.points)
+    
+    def get_bypass_point(self, start, end, side, safe_radius=5):
+        """获取单个绕行点（精细版）"""
         safe_deg = safe_radius / 111000
         
-        # 计算障碍物宽度的一半
-        half_width = (self.max_lon - self.min_lon) / 2
-        
-        # 计算从起点到终点的方向
+        # 计算航线方向
         dx = end[1] - start[1]
         dy = end[0] - start[0]
         length = math.sqrt(dx*dx + dy*dy)
@@ -225,19 +226,95 @@ class Obstacle:
         perp_x = -dy
         perp_y = dx
         
-        # 绕行偏移量 = 障碍物半宽 + 安全半径 + 额外余量
-        offset = half_width + safe_deg + 0.001
+        # 精细偏移：障碍物半宽 + 安全半径 + 小余量
+        half_width = self.width_lon / 2
+        offset = half_width + safe_deg + 0.0005
         
-        # 左绕行点
-        left_bypass = [self.center_lat + perp_y * offset, self.center_lon + perp_x * offset]
-        # 右绕行点
-        right_bypass = [self.center_lat - perp_y * offset, self.center_lon - perp_x * offset]
+        if side == 'left':
+            return [self.center_lat + perp_y * offset, self.center_lon + perp_x * offset]
+        else:
+            return [self.center_lat - perp_y * offset, self.center_lon - perp_x * offset]
+
+# ==================== 多障碍物绕行路径规划 ====================
+def plan_bypass_path(start, end, obstacles, flight_alt, safe_radius, side):
+    """
+    规划绕行路径
+    side: 'left' 或 'right'，绕行方向
+    返回: 路径点列表
+    """
+    waypoints = [start]
+    current = start
+    
+    # 按距离排序障碍物（从起点到终点方向）
+    def distance_to_line(p, s, e):
+        """点到线段距离的平方"""
+        return (p[0] - s[0])**2 + (p[1] - s[1])**2
+    
+    # 获取需要绕行的障碍物（在路径上且高度低于飞行高度）
+    blocking_obs = []
+    for obs_data in obstacles:
+        if isinstance(obs_data, dict):
+            if flight_alt < obs_data['height']:
+                obs = Obstacle.from_dict(obs_data)
+                if obs.intersects_line(start, end):
+                    blocking_obs.append(obs)
+        else:
+            if flight_alt < obs_data.height:
+                if obs_data.intersects_line(start, end):
+                    blocking_obs.append(obs_data)
+    
+    # 按到起点的距离排序
+    blocking_obs.sort(key=lambda obs: distance_to_line([obs.center_lat, obs.center_lon], start, end))
+    
+    # 依次绕过每个障碍物
+    for obs in blocking_obs:
+        # 获取绕行点
+        bypass = obs.get_bypass_point(current, end, side, safe_radius)
+        waypoints.append(bypass)
+        current = bypass
         
-        return left_bypass, right_bypass
+        # 检查绕行点是否与其他障碍物相交，如果相交则微调
+        for other_obs in blocking_obs:
+            if other_obs != obs and other_obs.contains(bypass):
+                # 微调偏移量
+                safe_deg = safe_radius / 111000
+                dx = end[1] - start[1]
+                dy = end[0] - start[0]
+                length = math.sqrt(dx*dx + dy*dy)
+                if length > 0:
+                    dx /= length
+                    dy /= length
+                perp_x = -dy
+                perp_y = dx
+                offset = other_obs.width_lon / 2 + safe_deg + 0.001
+                if side == 'left':
+                    new_bypass = [obs.center_lat + perp_y * offset, obs.center_lon + perp_x * offset]
+                else:
+                    new_bypass = [obs.center_lat - perp_y * offset, obs.center_lon - perp_x * offset]
+                waypoints[-1] = new_bypass
+                current = new_bypass
+                break
+    
+    waypoints.append(end)
+    
+    # 简化路径（去除共线的点）
+    simplified = [waypoints[0]]
+    for i in range(1, len(waypoints) - 1):
+        # 如果三点不共线，保留中间点
+        p1 = simplified[-1]
+        p2 = waypoints[i]
+        p3 = waypoints[i + 1]
+        # 计算叉积判断是否共线
+        cross = (p2[0] - p1[0]) * (p3[1] - p2[1]) - (p2[1] - p1[1]) * (p3[0] - p2[0])
+        if abs(cross) > 1e-8:
+            simplified.append(p2)
+    simplified.append(waypoints[-1])
+    
+    return simplified
 
 # ==================== 标题 ====================
 st.title("🛰️ 无人机智能监控系统")
-st.markdown("**南京科技职业学院** | 3D障碍物 | 多航线选择 | 心跳监控")
+st.markdown("**南京科技职业学院** | 多障碍物绕行 | 左/右/最佳航线")
 st.markdown("---")
 
 # ==================== 侧边栏 ====================
@@ -249,9 +326,9 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("📊 系统状态")
     st.success("✅ 系统运行正常")
-    config_status = get_config_status()
-    if config_status['exists']:
-        st.info(f"💾 障碍物配置\n共 {config_status['count']} 个 | {config_status['save_time']}")
+    config_status = get_config_status() if 'get_config_status' in dir() else {'exists': False}
+    if config_status.get('exists'):
+        st.info(f"💾 障碍物: {config_status['count']}个")
 
 # ==================== 标签页 ====================
 tab1, tab2 = st.tabs(["🗺️ 航线规划", "💓 心跳监控"])
@@ -263,12 +340,12 @@ with tab1:
     with col_left:
         st.subheader("🗺️ 卫星地图")
         
-        m = folium.Map(location=CAMPUS_GCJ02, zoom_start=17, control_scale=True)
+        m = folium.Map(location=CAMPUS, zoom_start=17, control_scale=True)
         folium.TileLayer('https://webst0{s}.is.autonavi.com/appmaptile?style=6&x={x}&y={y}&z={z}',
                          attr='高德卫星', subdomains=['1','2','3','4']).add_to(m)
         folium.TileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
                          attr='OpenStreetMap', name='街道地图').add_to(m)
-        folium.Marker(CAMPUS_GCJ02, popup="🏫 南京科技职业学院", icon=folium.Icon(color='red')).add_to(m)
+        folium.Marker(CAMPUS, popup="🏫 南京科技职业学院", icon=folium.Icon(color='red')).add_to(m)
         
         alt = st.session_state.flight_alt
         for obs_data in st.session_state.obstacles:
@@ -282,7 +359,8 @@ with tab1:
                 name = obs_data.name
             
             color = 'red' if alt < height else 'green'
-            folium.Polygon(points, color=color, weight=2, fill=True, fill_color=color, fill_opacity=0.3,
+            folium.Polygon(points, color=color, weight=2, fill=True, 
+                          fill_color=color, fill_opacity=0.3,
                           popup=f"{name}\n高度: {height}m").add_to(m)
         
         folium.Marker(st.session_state.point_a, popup="🚁 起点A", icon=folium.Icon(color='green')).add_to(m)
@@ -290,9 +368,10 @@ with tab1:
         
         if st.session_state.selected_plan:
             p = st.session_state.selected_plan
-            folium.PolyLine(p['points'], color=p['color'], weight=4).add_to(m)
-            if len(p['points']) > 2:
-                folium.Marker(p['points'][1], popup="绕行点", icon=folium.Icon(color='purple')).add_to(m)
+            folium.PolyLine(p['points'], color=p['color'], weight=4, opacity=0.9).add_to(m)
+            # 标记绕行点
+            for i, wp in enumerate(p['points'][1:-1], 1):
+                folium.Marker(wp, popup=f"绕行点{i}", icon=folium.Icon(color='purple', icon='refresh')).add_to(m)
         
         plugins.Draw(draw_options={'polygon': {'allowIntersection': False}}).add_to(m)
         plugins.MeasureControl().add_to(m)
@@ -412,55 +491,54 @@ with tab1:
         st.markdown("---")
         st.markdown("## 🗺️ 多航线规划")
         
-        # 查找阻挡障碍物
-        def find_blocking(start, end, obstacles, flight_alt):
-            for obs_data in obstacles:
-                points = obs_data['points'] if isinstance(obs_data, dict) else obs_data.points
-                height = obs_data['height'] if isinstance(obs_data, dict) else obs_data.height
-                if flight_alt < height:
-                    if line_intersects_polygon(start, end, points):
-                        if isinstance(obs_data, dict):
-                            return Obstacle.from_dict(obs_data)
-                        else:
-                            return obs_data
-            return None
-        
-        # 生成方案
+        # ========== 生成三条航线方案 ==========
         if st.button("🎯 生成航线方案", use_container_width=True, type="primary"):
             start = st.session_state.point_a
             end = st.session_state.point_b
-            hit = find_blocking(start, end, st.session_state.obstacles, alt)
-            
             straight_dist = calc_distance(start, end)
+            
+            # 检查是否有需要绕行的障碍物
+            has_blocking = False
+            for obs_data in st.session_state.obstacles:
+                height = obs_data['height'] if isinstance(obs_data, dict) else obs_data.height
+                if alt < height:
+                    points = obs_data['points'] if isinstance(obs_data, dict) else obs_data.points
+                    if line_intersects_polygon(start, end, points):
+                        has_blocking = True
+                        break
+            
             plans = []
             
-            if not hit:
-                plans.append({'name': '📏 直线飞越', 'points': [start, end], 'dist': straight_dist, 'color': 'blue', 'desc': '✅ 无障碍物'})
+            if not has_blocking:
+                # 无障碍物，直线
+                plans.append({'name': '📏 直线飞越', 'points': [start, end], 
+                             'dist': straight_dist, 'color': 'blue', 
+                             'desc': '✅ 无障碍物'})
             else:
-                left, right = hit.get_bypass_points(start, end, safe_radius)
-                
                 # 左绕行
-                left_dist = calc_distance(start, left) + calc_distance(left, end)
-                plans.append({'name': '⬅️ 左绕行', 'points': [start, left, end], 'dist': left_dist, 'color': 'orange', 
-                             'desc': f'左侧绕过 (多走{left_dist-straight_dist:.0f}m)'})
+                left_path = plan_bypass_path(start, end, st.session_state.obstacles, alt, safe_radius, 'left')
+                left_dist = sum(calc_distance(left_path[i], left_path[i+1]) for i in range(len(left_path)-1))
+                plans.append({'name': '⬅️ 左绕行', 'points': left_path, 'dist': left_dist, 
+                             'color': 'orange', 'desc': f'多走{left_dist-straight_dist:.0f}m'})
                 
                 # 右绕行
-                right_dist = calc_distance(start, right) + calc_distance(right, end)
-                plans.append({'name': '➡️ 右绕行', 'points': [start, right, end], 'dist': right_dist, 'color': 'purple',
-                             'desc': f'右侧绕过 (多走{right_dist-straight_dist:.0f}m)'})
+                right_path = plan_bypass_path(start, end, st.session_state.obstacles, alt, safe_radius, 'right')
+                right_dist = sum(calc_distance(right_path[i], right_path[i+1]) for i in range(len(right_path)-1))
+                plans.append({'name': '➡️ 右绕行', 'points': right_path, 'dist': right_dist, 
+                             'color': 'purple', 'desc': f'多走{right_dist-straight_dist:.0f}m'})
                 
                 # 最佳航线
                 best = min(plans, key=lambda x: x['dist']).copy()
                 best['name'] = '⭐ 最佳航线'
                 best['color'] = 'gold'
-                best['desc'] = f'最短路径 (省{abs(plans[0]["dist"] - plans[1]["dist"]):.0f}m)'
+                best['desc'] = f'省{abs(plans[0]["dist"] - plans[1]["dist"]):.0f}m'
                 plans.append(best)
             
             st.session_state.route_plans = plans
-            st.session_state.selected_plan = plans[-1]  # 默认选中最佳
+            st.session_state.selected_plan = plans[-1]
             st.rerun()
         
-        # 显示方案
+        # ========== 显示方案 ==========
         if st.session_state.route_plans:
             st.markdown("---")
             st.markdown("### 📋 可选方案")
@@ -493,7 +571,7 @@ with tab1:
             if st.session_state.selected_plan:
                 p = st.session_state.selected_plan
                 straight = calc_distance(st.session_state.point_a, st.session_state.point_b)
-                st.info(f"**当前: {p['name']}** | {p['dist']:.0f}m | 比直线多走: {p['dist']-straight:.0f}m")
+                st.info(f"**当前: {p['name']}** | {p['dist']:.0f}m | 比直线多: {p['dist']-straight:.0f}m")
                 if st.button("✈️ 确认使用", use_container_width=True, type="primary"):
                     st.session_state.confirmed_plan = p
                     st.success(f"✅ 已确认")
