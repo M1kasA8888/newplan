@@ -183,7 +183,6 @@ class Obstacle:
         self.max_lon = max(lons)
         self.center_lat = (self.min_lat + self.max_lat) / 2
         self.center_lon = (self.min_lon + self.max_lon) / 2
-        # 障碍物宽度（度）
         self.width_lat = self.max_lat - self.min_lat
         self.width_lon = self.max_lon - self.min_lon
     
@@ -204,37 +203,36 @@ class Obstacle:
     def need_bypass(self, flight_alt):
         return flight_alt < self.height
     
-    def can_fly_over(self, flight_alt):
-        return flight_alt >= self.height
+    def get_edge_points(self):
+        """获取障碍物的四个边缘点"""
+        return {
+            'top': [(self.min_lat + self.max_lat)/2, self.min_lon],
+            'bottom': [(self.min_lat + self.max_lat)/2, self.max_lon],
+            'left': [self.min_lat, (self.min_lon + self.max_lon)/2],
+            'right': [self.max_lat, (self.min_lon + self.max_lon)/2]
+        }
     
-    def get_nearest_point_on_edge(self, start, end):
-        """获取线段与障碍物边缘的最近交点"""
-        # 简化：返回障碍物靠近航线一侧的边缘中点
-        # 计算从起点到终点的方向
+    def get_nearest_edge(self, start, end):
+        """获取离航线最近的边缘"""
+        # 计算航线方向
         dx = end[1] - start[1]
         dy = end[0] - start[0]
         
-        # 判断障碍物在航线的左侧还是右侧
-        # 使用叉积
+        # 使用叉积判断障碍物在航线的哪一侧
         cross = dx * (self.center_lat - start[0]) - dy * (self.center_lon - start[1])
         
         if cross > 0:
-            # 障碍物在左侧，绕行点取障碍物左侧边缘
-            bypass_lat = self.center_lat - self.width_lat * 0.5
-            bypass_lon = self.center_lon
+            # 障碍物在左侧，选择左侧边缘点
+            return 'left', [self.min_lat, (self.min_lon + self.max_lon)/2]
         else:
-            # 障碍物在右侧，绕行点取障碍物右侧边缘
-            bypass_lat = self.center_lat + self.width_lat * 0.5
-            bypass_lon = self.center_lon
-        
-        return [bypass_lat, bypass_lon]
+            # 障碍物在右侧，选择右侧边缘点
+            return 'right', [self.max_lat, (self.min_lon + self.max_lon)/2]
     
-    def get_left_bypass(self, start, end, safe_radius=5):
-        """获取左侧绕行点（靠近障碍物边缘）"""
-        # 安全半径转换为度
-        safe_deg = safe_radius / 111000
+    def get_bypass_point(self, start, end, side, safe_radius=5):
+        """获取绕行点，更贴近障碍物边缘"""
+        safe_deg = safe_radius / 111000  # 安全半径转度数
         
-        # 计算垂直方向
+        # 计算航线方向
         dx = end[1] - start[1]
         dy = end[0] - start[0]
         L = math.sqrt(dx*dx + dy*dy)
@@ -242,35 +240,19 @@ class Obstacle:
             dx /= L
             dy /= L
         
-        # 垂直向量（左侧）
+        # 垂直方向
         perp_x = -dy
         perp_y = dx
         
-        # 绕行距离 = 障碍物宽度的一半 + 安全半径
-        bypass_distance = self.width_lon * 0.4 + safe_deg
-        bypass_distance = max(bypass_distance, 0.001)  # 至少110米
-        
-        return [self.center_lat + perp_y * bypass_distance, self.center_lon + perp_x * bypass_distance]
-    
-    def get_right_bypass(self, start, end, safe_radius=5):
-        """获取右侧绕行点（靠近障碍物边缘）"""
-        safe_deg = safe_radius / 111000
-        
-        dx = end[1] - start[1]
-        dy = end[0] - start[0]
-        L = math.sqrt(dx*dx + dy*dy)
-        if L > 0:
-            dx /= L
-            dy /= L
-        
-        # 垂直向量（右侧）
-        perp_x = -dy
-        perp_y = dx
-        
-        bypass_distance = self.width_lon * 0.4 + safe_deg
-        bypass_distance = max(bypass_distance, 0.001)
-        
-        return [self.center_lat - perp_y * bypass_distance, self.center_lon - perp_x * bypass_distance]
+        # 根据侧边选择绕行距离
+        if side == 'left':
+            # 左侧绕行：障碍物宽度的30% + 安全半径
+            bypass_offset = self.width_lon * 0.3 + safe_deg
+            return [self.center_lat + perp_y * bypass_offset, self.center_lon + perp_x * bypass_offset]
+        else:
+            # 右侧绕行
+            bypass_offset = self.width_lon * 0.3 + safe_deg
+            return [self.center_lat - perp_y * bypass_offset, self.center_lon - perp_x * bypass_offset]
 
 def load_obstacles_from_state():
     obstacles = []
@@ -283,7 +265,7 @@ def load_obstacles_from_state():
 
 # ==================== 标题 ====================
 st.title("🛰️ 无人机智能监控系统")
-st.markdown("**南京科技职业学院** | 3D障碍物（指定高度） | 多航线选择 | 心跳监控")
+st.markdown("**南京科技职业学院** | 3D障碍物 | 多航线选择 | 心跳监控")
 st.markdown("---")
 
 # ==================== 标签页 ====================
@@ -358,8 +340,7 @@ with tab1:
             name = st.text_input("障碍物名称", value=st.session_state.temp_name)
             st.session_state.temp_name = name if name else "建筑物"
             
-            height = st.number_input("障碍物高度 (m)", value=st.session_state.temp_height, min_value=1, max_value=200, step=5,
-                                      help="障碍物从地面到顶部的高度")
+            height = st.number_input("障碍物高度 (m)", value=st.session_state.temp_height, min_value=1, max_value=200, step=5)
             st.session_state.temp_height = height
             
             st.progress(min(1.0, height/200))
@@ -522,38 +503,22 @@ with tab1:
             end = st.session_state.point_b
             hit = find_blocking_obstacle(start, end, st.session_state.obstacles, alt)
             
+            # 计算直线距离
+            straight_dist = calc_distance(start, end)
+            
             plans = []
             
             if not hit:
-                can_fly_over_all = True
-                for obs_data in st.session_state.obstacles:
-                    if isinstance(obs_data, dict):
-                        if alt < obs_data['height']:
-                            can_fly_over_all = False
-                            break
-                    else:
-                        if alt < obs_data.height:
-                            can_fly_over_all = False
-                            break
-                
-                if can_fly_over_all and st.session_state.obstacles:
-                    desc = f"✅ 飞行高度{alt}m高于所有障碍物"
-                else:
-                    desc = "✅ 无障碍物阻挡"
-                
                 plans.append({
                     'name': '📏 直线飞越',
                     'points': [start, end],
-                    'dist': calc_distance(start, end),
+                    'dist': straight_dist,
                     'color': 'blue',
-                    'desc': desc
+                    'desc': f'✅ 直线飞行'
                 })
             else:
-                # 计算直线距离作为参考
-                straight_dist = calc_distance(start, end)
-                
                 # 左绕行
-                left = hit.get_left_bypass(start, end, safe_radius)
+                left = hit.get_bypass_point(start, end, 'left', safe_radius)
                 left_dist = calc_distance(start, left) + calc_distance(left, end)
                 left_extra = left_dist - straight_dist
                 plans.append({
@@ -561,11 +526,11 @@ with tab1:
                     'points': [start, left, end],
                     'dist': left_dist,
                     'color': 'orange',
-                    'desc': f'从「{hit.name}」左侧绕过 (多走{left_extra:.0f}m)'
+                    'desc': f'从左侧绕过 (多走{left_extra:.0f}m)'
                 })
                 
                 # 右绕行
-                right = hit.get_right_bypass(start, end, safe_radius)
+                right = hit.get_bypass_point(start, end, 'right', safe_radius)
                 right_dist = calc_distance(start, right) + calc_distance(right, end)
                 right_extra = right_dist - straight_dist
                 plans.append({
@@ -573,32 +538,20 @@ with tab1:
                     'points': [start, right, end],
                     'dist': right_dist,
                     'color': 'purple',
-                    'desc': f'从「{hit.name}」右侧绕过 (多走{right_extra:.0f}m)'
+                    'desc': f'从右侧绕过 (多走{right_extra:.0f}m)'
                 })
-                
-                # 最佳航线
-                if left_dist <= right_dist:
-                    best_extra = left_extra
-                    plans.append({
-                        'name': '⭐ 最佳航线',
-                        'points': [start, left, end],
-                        'dist': left_dist,
-                        'color': 'gold',
-                        'desc': f'最优路径 (比另一方案少{abs(left_dist-right_dist):.0f}m)'
-                    })
-                else:
-                    best_extra = right_extra
-                    plans.append({
-                        'name': '⭐ 最佳航线',
-                        'points': [start, right, end],
-                        'dist': right_dist,
-                        'color': 'gold',
-                        'desc': f'最优路径 (比另一方案少{abs(left_dist-right_dist):.0f}m)'
-                    })
+            
+            # 按距离排序找出最佳航线
+            sorted_plans = sorted(plans, key=lambda x: x['dist'])
+            best = sorted_plans[0].copy()
+            best['name'] = '⭐ 最佳航线'
+            best['color'] = 'gold'
+            best['desc'] = f'最短路径 (比另一方案少{abs(plans[0]["dist"] - plans[1]["dist"]):.0f}m)'
+            plans.append(best)
             
             st.session_state.route_plans = plans
             if plans:
-                st.session_state.selected_plan = plans[0]
+                st.session_state.selected_plan = best  # 默认选中最佳航线
             st.rerun()
         
         # ========== 显示方案 ==========
@@ -606,6 +559,7 @@ with tab1:
             st.markdown("---")
             st.markdown("### 📋 可选方案")
             
+            # 显示直线（如果有）
             for i, p in enumerate(st.session_state.route_plans):
                 col1, col2, col3 = st.columns([2, 1, 1])
                 with col1:
