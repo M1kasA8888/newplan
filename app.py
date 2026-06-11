@@ -7,8 +7,6 @@ import json
 import os
 import random
 import time
-import threading
-import queue
 from datetime import datetime
 import pandas as pd
 import plotly.graph_objects as go
@@ -19,15 +17,30 @@ st.set_page_config(page_title="无人机智能监控系统", page_icon="🛰️"
 # ==================== 南京科技职业学院坐标 ====================
 CAMPUS = [32.234097, 118.749413]
 
+# ==================== 配置文件路径 ====================
+OBSTACLE_CONFIG_FILE = "obstacle_config.json"
+
 # ==================== 初始化 Session State ====================
 if 'obstacles' not in st.session_state:
-    st.session_state.obstacles = []
+    # 尝试加载保存的障碍物
+    if os.path.exists(OBSTACLE_CONFIG_FILE):
+        try:
+            with open(OBSTACLE_CONFIG_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                st.session_state.obstacles = data.get('obstacles', [])
+        except:
+            st.session_state.obstacles = []
+    else:
+        st.session_state.obstacles = []
+
 if 'point_a' not in st.session_state:
     st.session_state.point_a = [32.2323, 118.749]
 if 'point_b' not in st.session_state:
     st.session_state.point_b = [32.2344, 118.749]
 if 'flight_alt' not in st.session_state:
-    st.session_state.flight_alt = 20
+    st.session_state.flight_alt = 50
+if 'safe_radius' not in st.session_state:
+    st.session_state.safe_radius = 5  # 默认5米
 if 'route_plans' not in st.session_state:
     st.session_state.route_plans = []
 if 'selected_plan' not in st.session_state:
@@ -39,11 +52,42 @@ if 'temp_obs' not in st.session_state:
 if 'temp_h' not in st.session_state:
     st.session_state.temp_h = [0, 30]
 if 'temp_name' not in st.session_state:
-    st.session_state.temp_name = "教学楼"
-if 'heartbeat_running' not in st.session_state:
-    st.session_state.heartbeat_running = False
-if 'heartbeat_data' not in st.session_state:
-    st.session_state.heartbeat_data = []
+    st.session_state.temp_name = "建筑物"
+if 'show_height_panel' not in st.session_state:
+    st.session_state.show_height_panel = False
+
+# ==================== 障碍物保存/加载函数 ====================
+def save_obstacles_to_file():
+    """保存障碍物到JSON文件"""
+    data = {
+        'save_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        'obstacles': st.session_state.obstacles,
+        'count': len(st.session_state.obstacles)
+    }
+    with open(OBSTACLE_CONFIG_FILE, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    return True
+
+def load_obstacles_from_file():
+    """从JSON文件加载障碍物"""
+    if os.path.exists(OBSTACLE_CONFIG_FILE):
+        with open(OBSTACLE_CONFIG_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            st.session_state.obstacles = data.get('obstacles', [])
+        return True
+    return False
+
+def get_config_status():
+    """获取配置文件状态"""
+    if os.path.exists(OBSTACLE_CONFIG_FILE):
+        with open(OBSTACLE_CONFIG_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return {
+            'exists': True,
+            'count': data.get('count', 0),
+            'save_time': data.get('save_time', '未知')
+        }
+    return {'exists': False, 'count': 0}
 
 # ==================== 心跳模拟器 ====================
 class HeartbeatSimulator:
@@ -65,10 +109,8 @@ class HeartbeatSimulator:
     def update(self):
         if not self.running:
             return None
-        
         current = time.time()
         elapsed = current - self.last_time
-        
         if elapsed >= 1:
             self.last_time = current
             heartbeat = {
@@ -81,7 +123,6 @@ class HeartbeatSimulator:
             if len(self.history) > 50:
                 self.history.pop(0)
             return heartbeat
-        
         if elapsed > 3 and not self.offline:
             self.offline = True
             timeout = {
@@ -94,7 +135,6 @@ class HeartbeatSimulator:
             return timeout
         elif elapsed <= 3 and self.offline:
             self.offline = False
-        
         return None
     
     def get_stats(self):
@@ -109,6 +149,8 @@ class HeartbeatSimulator:
 
 if 'heartbeat_sim' not in st.session_state:
     st.session_state.heartbeat_sim = HeartbeatSimulator()
+if 'heartbeat_running' not in st.session_state:
+    st.session_state.heartbeat_running = False
 
 # ==================== 工具函数 ====================
 def calc_distance(p1, p2):
@@ -142,10 +184,22 @@ class Obstacle:
         self.cx = (min(lats)+max(lats))/2
         self.cy = (min(lons)+max(lons))/2
     
+    def to_dict(self):
+        return {
+            'points': self.points,
+            'min_h': self.min_h,
+            'max_h': self.max_h,
+            'name': self.name
+        }
+    
+    @classmethod
+    def from_dict(cls, data):
+        return cls(data['points'], data['min_h'], data['max_h'], data['name'])
+    
     def contains(self, point):
         return point_in_polygon(point, self.points)
     
-    def get_left_bypass(self, start, end):
+    def get_left_bypass(self, start, end, safe_radius=5):
         dx = end[1] - start[1]
         dy = end[0] - start[0]
         L = math.sqrt(dx*dx+dy*dy)
@@ -154,10 +208,13 @@ class Obstacle:
             dy /= L
         px = -dy
         py = dx
-        off = 0.003
+        # 绕行距离 = 障碍物半宽 + 安全半径
+        width_deg = (max([p[1] for p in self.points]) - min([p[1] for p in self.points])) / 2
+        off = width_deg + (safe_radius / 111000)
+        off = max(off, 0.003)
         return [self.cx + py*off, self.cy + px*off]
     
-    def get_right_bypass(self, start, end):
+    def get_right_bypass(self, start, end, safe_radius=5):
         dx = end[1] - start[1]
         dy = end[0] - start[0]
         L = math.sqrt(dx*dx+dy*dy)
@@ -166,8 +223,20 @@ class Obstacle:
             dy /= L
         px = -dy
         py = dx
-        off = 0.003
+        width_deg = (max([p[1] for p in self.points]) - min([p[1] for p in self.points])) / 2
+        off = width_deg + (safe_radius / 111000)
+        off = max(off, 0.003)
         return [self.cx - py*off, self.cy - px*off]
+
+# 转换障碍物字典为对象
+def load_obstacles_from_state():
+    obstacles = []
+    for obs_data in st.session_state.obstacles:
+        if isinstance(obs_data, dict):
+            obstacles.append(Obstacle.from_dict(obs_data))
+        else:
+            obstacles.append(obs_data)
+    return obstacles
 
 # ==================== 标题 ====================
 st.title("🛰️ 无人机智能监控系统")
@@ -193,17 +262,29 @@ with tab1:
         folium.Marker(CAMPUS, popup="🏫 南京科技职业学院", icon=folium.Icon(color='red')).add_to(m)
         
         alt = st.session_state.flight_alt
-        for obs in st.session_state.obstacles:
-            if alt < obs.min_h:
+        for obs_data in st.session_state.obstacles:
+            # 兼容字典和对象
+            if isinstance(obs_data, dict):
+                points = obs_data['points']
+                min_h = obs_data['min_h']
+                max_h = obs_data['max_h']
+                name = obs_data['name']
+            else:
+                points = obs_data.points
+                min_h = obs_data.min_h
+                max_h = obs_data.max_h
+                name = obs_data.name
+            
+            if alt < min_h:
                 color = 'red'
-            elif alt > obs.max_h:
+            elif alt > max_h:
                 color = 'green'
             else:
                 color = 'orange'
             folium.Polygon(
-                obs.points, color=color, weight=2, fill=True,
+                points, color=color, weight=2, fill=True,
                 fill_color=color, fill_opacity=0.3,
-                popup=f"{obs.name}\n{obs.min_h}-{obs.max_h}m"
+                popup=f"{name}\n{min_h}-{max_h}m"
             ).add_to(m)
         
         folium.Marker(st.session_state.point_a, popup="🚁 起点A", icon=folium.Icon(color='green')).add_to(m)
@@ -226,51 +307,53 @@ with tab1:
                 pts = [[c[1], c[0]] for c in d['geometry']['coordinates'][0]]
                 if len(pts) >= 3:
                     st.session_state.temp_obs = pts
-                    st.success(f"✅ 已绘制 {len(pts)} 个点")
+                    st.session_state.show_height_panel = True
+                    st.success(f"✅ 已绘制 {len(pts)} 个点，请在右侧设置高度和名称")
     
     with col_right:
-        # 新建障碍物
-        if st.session_state.temp_obs:
-            st.markdown("### 🆕 新建障碍物")
-            name = st.text_input("名称", value=st.session_state.temp_name)
-            st.session_state.temp_name = name if name else "障碍物"
+        # ========== 新建障碍物（高度设置） ==========
+        if st.session_state.show_height_panel and st.session_state.temp_obs:
+            st.markdown("### 🆕 新建3D障碍物")
+            st.caption(f"已绘制 {len(st.session_state.temp_obs)} 个边界点")
+            
+            name = st.text_input("障碍物名称", value=st.session_state.temp_name)
+            st.session_state.temp_name = name if name else "建筑物"
             
             col1, col2 = st.columns(2)
             with col1:
-                # 修复：确保默认值在有效范围内
-                default_min = st.session_state.temp_h[0]
-                if default_min < 0 or default_min > 200:
-                    default_min = 0
-                min_h = st.number_input("最低高度(m)", value=default_min, min_value=0, max_value=200, step=5)
+                min_h = st.number_input("最低高度(m)", value=st.session_state.temp_h[0], min_value=0, max_value=200, step=5)
             with col2:
-                default_max = st.session_state.temp_h[1]
-                if default_max < min_h + 1 or default_max > 300:
-                    default_max = min_h + 10
-                max_h = st.number_input("最高高度(m)", value=default_max, min_value=min_h + 1, max_value=300, step=5)
+                max_h = st.number_input("最高高度(m)", value=st.session_state.temp_h[1], min_value=min_h+1, max_value=300, step=5)
             
             st.session_state.temp_h = [min_h, max_h]
-            
-            # 进度条
-            progress_val = max(0, min(1.0, max_h / 300))
-            st.progress(progress_val)
+            st.progress(min(1.0, max_h/300))
             st.caption(f"📊 障碍物高度: {min_h}m - {max_h}m")
             
             col1, col2 = st.columns(2)
             with col1:
-                if st.button("✅ 保存", type="primary", use_container_width=True):
-                    new_obs = Obstacle(st.session_state.temp_obs, min_h, max_h, st.session_state.temp_name)
+                if st.button("✅ 保存障碍物", type="primary", use_container_width=True):
+                    new_obs = {
+                        'points': st.session_state.temp_obs,
+                        'min_h': min_h,
+                        'max_h': max_h,
+                        'name': st.session_state.temp_name
+                    }
                     st.session_state.obstacles.append(new_obs)
                     st.session_state.temp_obs = None
+                    st.session_state.show_height_panel = False
+                    st.session_state.temp_h = [0, 30]
+                    st.session_state.temp_name = "建筑物"
                     st.session_state.route_plans = []
                     st.session_state.selected_plan = None
                     st.rerun()
             with col2:
                 if st.button("🗑️ 取消", use_container_width=True):
                     st.session_state.temp_obs = None
+                    st.session_state.show_height_panel = False
                     st.rerun()
             st.markdown("---")
         
-        # 起点
+        # ========== 起点设置 ==========
         st.markdown("### 🚁 起点 A")
         col1, col2 = st.columns(2)
         with col1:
@@ -282,7 +365,7 @@ with tab1:
             st.session_state.route_plans = []
             st.rerun()
         
-        # 终点
+        # ========== 终点设置 ==========
         st.markdown("### 🎯 终点 B")
         col1, col2 = st.columns(2)
         with col1:
@@ -296,96 +379,171 @@ with tab1:
         
         st.markdown("---")
         
-        # 飞行高度
+        # ========== 飞行参数 ==========
         st.markdown("### ⚙️ 飞行参数")
         alt = st.slider("飞行高度 (m)", 10, 150, st.session_state.flight_alt)
         st.session_state.flight_alt = alt
         
-        # 高度冲突检测
+        safe_radius = st.slider("安全半径 (m)", 1, 30, st.session_state.safe_radius)
+        st.session_state.safe_radius = safe_radius
+        
+        st.info(f"🛡️ 安全半径: {safe_radius}m | 无人机与障碍物保持此距离")
+        
+        # ========== 高度冲突检测 ==========
         if st.session_state.obstacles:
             st.markdown("**📊 高度冲突检测**")
-            for obs in st.session_state.obstacles:
-                if alt < obs.min_h:
-                    st.success(f"✅ 低于「{obs.name}」({obs.min_h}m)，将**绕行**")
-                elif alt > obs.max_h:
-                    st.success(f"✅ 高于「{obs.name}」({obs.max_h}m)，可**飞越**")
+            for obs_data in st.session_state.obstacles:
+                if isinstance(obs_data, dict):
+                    name = obs_data['name']
+                    min_h = obs_data['min_h']
+                    max_h = obs_data['max_h']
                 else:
-                    st.warning(f"⚠️ 与「{obs.name}」冲突 ({obs.min_h}-{obs.max_h}m)")
+                    name = obs_data.name
+                    min_h = obs_data.min_h
+                    max_h = obs_data.max_h
+                
+                if alt < min_h:
+                    st.success(f"✅ 低于「{name}」({min_h}m)，将**绕行**")
+                elif alt > max_h:
+                    st.success(f"✅ 高于「{name}」({max_h}m)，可**飞越**")
+                else:
+                    st.warning(f"⚠️ 与「{name}」冲突 ({min_h}-{max_h}m)")
         
         st.markdown("---")
         
-        # 障碍物列表
-        st.markdown("### 🚧 障碍物列表")
-        st.caption(f"共 {len(st.session_state.obstacles)} 个")
-        for i, obs in enumerate(st.session_state.obstacles):
-            if alt < obs.min_h:
+        # ========== 障碍物管理 ==========
+        st.markdown("### 🚧 障碍物管理")
+        st.caption(f"共 {len(st.session_state.obstacles)} 个障碍物")
+        
+        for i, obs_data in enumerate(st.session_state.obstacles):
+            if isinstance(obs_data, dict):
+                name = obs_data['name']
+                min_h = obs_data['min_h']
+                max_h = obs_data['max_h']
+            else:
+                name = obs_data.name
+                min_h = obs_data.min_h
+                max_h = obs_data.max_h
+            
+            if alt < min_h:
                 icon = "🔄"
-            elif alt > obs.max_h:
+            elif alt > max_h:
                 icon = "⬆️"
             else:
                 icon = "⚠️"
-            with st.expander(f"{icon} {obs.name} ({obs.min_h}-{obs.max_h}m)"):
+            with st.expander(f"{icon} {name} ({min_h}-{max_h}m)"):
                 if st.button(f"删除", key=f"del_{i}"):
                     st.session_state.obstacles.pop(i)
                     st.session_state.route_plans = []
                     st.rerun()
         
-        if st.button("🗑️ 清空全部", use_container_width=True):
-            st.session_state.obstacles = []
-            st.session_state.route_plans = []
-            st.rerun()
+        # ========== 保存/加载按钮 ==========
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            if st.button("💾 保存配置", use_container_width=True):
+                save_obstacles_to_file()
+                st.success(f"已保存 {len(st.session_state.obstacles)} 个障碍物")
+        with col2:
+            if st.button("📂 加载配置", use_container_width=True):
+                if load_obstacles_from_file():
+                    st.session_state.route_plans = []
+                    st.success("加载成功")
+                    st.rerun()
+                else:
+                    st.warning("没有找到配置文件")
+        with col3:
+            if st.button("🗑️ 清空全部", use_container_width=True):
+                st.session_state.obstacles = []
+                st.session_state.route_plans = []
+                st.rerun()
+        
+        # 配置文件状态
+        config_status = get_config_status()
+        if config_status['exists']:
+            st.caption(f"📁 配置文件: {config_status['count']}个障碍物 | {config_status['save_time']}")
         
         st.markdown("---")
         st.markdown("## 🗺️ 多航线规划")
         
-        # 找碰撞障碍物
-        def find_blocking(start, end):
-            for obs in st.session_state.obstacles:
-                if alt < obs.min_h:
-                    for t in range(21):
-                        t = t/20
-                        lat = start[0] + (end[0]-start[0])*t
-                        lon = start[1] + (end[1]-start[1])*t
-                        if obs.contains([lat, lon]):
-                            return obs
+        # ========== 找碰撞障碍物 ==========
+        def find_blocking(start, end, obstacles, flight_alt):
+            for obs_data in obstacles:
+                if isinstance(obs_data, dict):
+                    if flight_alt < obs_data['min_h']:
+                        obs = Obstacle.from_dict(obs_data)
+                    else:
+                        continue
+                else:
+                    if flight_alt < obs_data.min_h:
+                        obs = obs_data
+                    else:
+                        continue
+                
+                for t in range(21):
+                    t = t/20
+                    lat = start[0] + (end[0]-start[0])*t
+                    lon = start[1] + (end[1]-start[1])*t
+                    if obs.contains([lat, lon]):
+                        return obs
             return None
         
-        # 生成方案按钮
+        # ========== 生成航线方案按钮 ==========
         if st.button("🎯 生成航线方案", use_container_width=True, type="primary"):
             start = st.session_state.point_a
             end = st.session_state.point_b
-            hit = find_blocking(start, end)
+            hit = find_blocking(start, end, st.session_state.obstacles, alt)
             
             plans = []
+            
             if not hit:
+                # 检查是否可以飞越
+                can_fly_over = True
+                for obs_data in st.session_state.obstacles:
+                    if isinstance(obs_data, dict):
+                        if alt < obs_data['max_h']:
+                            can_fly_over = False
+                            break
+                    else:
+                        if alt < obs_data.max_h:
+                            can_fly_over = False
+                            break
+                
+                if can_fly_over and st.session_state.obstacles:
+                    desc = f"✅ 飞行高度{alt}m高于所有障碍物，直接飞越"
+                else:
+                    desc = "✅ 无障碍物阻挡，直线飞行"
+                
                 plans.append({
-                    'name': '📏 直线路径',
+                    'name': '📏 直线飞越',
                     'points': [start, end],
                     'dist': calc_distance(start, end),
                     'color': 'blue',
-                    'desc': '✅ 无障碍物阻挡'
+                    'desc': desc
                 })
             else:
+                # 有障碍物，生成三个绕行方案
                 # 左绕行
-                left = hit.get_left_bypass(start, end)
+                left = hit.get_left_bypass(start, end, safe_radius)
                 left_dist = calc_distance(start, left) + calc_distance(left, end)
                 plans.append({
                     'name': '⬅️ 左绕行',
                     'points': [start, left, end],
                     'dist': left_dist,
                     'color': 'orange',
-                    'desc': f'从「{hit.name}」左侧绕过'
+                    'desc': f'从「{hit.name}」左侧绕过 (安全半径{safe_radius}m)'
                 })
+                
                 # 右绕行
-                right = hit.get_right_bypass(start, end)
+                right = hit.get_right_bypass(start, end, safe_radius)
                 right_dist = calc_distance(start, right) + calc_distance(right, end)
                 plans.append({
                     'name': '➡️ 右绕行',
                     'points': [start, right, end],
                     'dist': right_dist,
                     'color': 'purple',
-                    'desc': f'从「{hit.name}」右侧绕过'
+                    'desc': f'从「{hit.name}」右侧绕过 (安全半径{safe_radius}m)'
                 })
+                
                 # 最佳航线
                 if left_dist <= right_dist:
                     plans.append({
@@ -393,7 +551,7 @@ with tab1:
                         'points': [start, left, end],
                         'dist': left_dist,
                         'color': 'gold',
-                        'desc': f'最短路径，比另一方案节省{abs(left_dist-right_dist):.0f}m'
+                        'desc': f'最优路径，比另一方案节省{abs(left_dist-right_dist):.0f}m'
                     })
                 else:
                     plans.append({
@@ -401,7 +559,7 @@ with tab1:
                         'points': [start, right, end],
                         'dist': right_dist,
                         'color': 'gold',
-                        'desc': f'最短路径，比另一方案节省{abs(left_dist-right_dist):.0f}m'
+                        'desc': f'最优路径，比另一方案节省{abs(left_dist-right_dist):.0f}m'
                     })
             
             st.session_state.route_plans = plans
@@ -409,7 +567,7 @@ with tab1:
                 st.session_state.selected_plan = plans[0]
             st.rerun()
         
-        # 显示三个方案
+        # ========== 显示三个方案 ==========
         if st.session_state.route_plans:
             st.markdown("---")
             st.markdown("### 📋 可选方案")
@@ -452,7 +610,7 @@ with tab1:
             st.markdown("### ✅ 当前航线")
             p = st.session_state.confirmed_plan
             st.success(f"**{p['name']}**")
-            st.caption(f"总航程: {p['dist']:.0f}m | 预计时间: {p['dist']/15:.0f}s")
+            st.caption(f"总航程: {p['dist']:.0f}m | 预计时间: {p['dist']/15:.0f}s | 安全半径: {safe_radius}m")
 
 # ==================== Tab 2: 心跳监控 ====================
 with tab2:
