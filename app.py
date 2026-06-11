@@ -169,6 +169,16 @@ def point_in_polygon(point, poly):
             inside = not inside
     return inside
 
+def line_intersects_polygon(start, end, poly):
+    """检查线段是否与多边形相交"""
+    for t in range(21):
+        t = t/20
+        lat = start[0] + (end[0]-start[0])*t
+        lon = start[1] + (end[1]-start[1])*t
+        if point_in_polygon([lat, lon], poly):
+            return True
+    return False
+
 class Obstacle:
     def __init__(self, points, height, name):
         self.points = points
@@ -185,6 +195,12 @@ class Obstacle:
         self.center_lon = (self.min_lon + self.max_lon) / 2
         self.width_lat = self.max_lat - self.min_lat
         self.width_lon = self.max_lon - self.min_lon
+        
+        # 计算边界点
+        self.left_edge = [self.center_lat, self.min_lon]
+        self.right_edge = [self.center_lat, self.max_lon]
+        self.top_edge = [self.min_lat, self.center_lon]
+        self.bottom_edge = [self.max_lat, self.center_lon]
     
     def to_dict(self):
         return {
@@ -203,56 +219,35 @@ class Obstacle:
     def need_bypass(self, flight_alt):
         return flight_alt < self.height
     
-    def get_edge_points(self):
-        """获取障碍物的四个边缘点"""
-        return {
-            'top': [(self.min_lat + self.max_lat)/2, self.min_lon],
-            'bottom': [(self.min_lat + self.max_lat)/2, self.max_lon],
-            'left': [self.min_lat, (self.min_lon + self.max_lon)/2],
-            'right': [self.max_lat, (self.min_lon + self.max_lon)/2]
-        }
-    
-    def get_nearest_edge(self, start, end):
-        """获取离航线最近的边缘"""
-        # 计算航线方向
-        dx = end[1] - start[1]
-        dy = end[0] - start[0]
-        
-        # 使用叉积判断障碍物在航线的哪一侧
-        cross = dx * (self.center_lat - start[0]) - dy * (self.center_lon - start[1])
-        
-        if cross > 0:
-            # 障碍物在左侧，选择左侧边缘点
-            return 'left', [self.min_lat, (self.min_lon + self.max_lon)/2]
-        else:
-            # 障碍物在右侧，选择右侧边缘点
-            return 'right', [self.max_lat, (self.min_lon + self.max_lon)/2]
-    
     def get_bypass_point(self, start, end, side, safe_radius=5):
-        """获取绕行点，更贴近障碍物边缘"""
-        safe_deg = safe_radius / 111000  # 安全半径转度数
+        """获取绕行点"""
+        safe_deg = safe_radius / 111000
         
-        # 计算航线方向
+        # 根据侧边选择基准点
+        if side == 'left':
+            base_point = self.left_edge
+        else:
+            base_point = self.right_edge
+        
+        # 计算从起点到终点的方向
         dx = end[1] - start[1]
         dy = end[0] - start[0]
-        L = math.sqrt(dx*dx + dy*dy)
-        if L > 0:
-            dx /= L
-            dy /= L
+        length = math.sqrt(dx*dx + dy*dy)
+        if length > 0:
+            dx /= length
+            dy /= length
         
-        # 垂直方向
+        # 垂直方向（向外侧偏移）
         perp_x = -dy
         perp_y = dx
         
-        # 根据侧边选择绕行距离
+        # 偏移距离 = 障碍物宽度/4 + 安全半径
         if side == 'left':
-            # 左侧绕行：障碍物宽度的30% + 安全半径
-            bypass_offset = self.width_lon * 0.3 + safe_deg
-            return [self.center_lat + perp_y * bypass_offset, self.center_lon + perp_x * bypass_offset]
+            offset = self.width_lon * 0.25 + safe_deg
+            return [base_point[0] + perp_y * offset, base_point[1] + perp_x * offset]
         else:
-            # 右侧绕行
-            bypass_offset = self.width_lon * 0.3 + safe_deg
-            return [self.center_lat - perp_y * bypass_offset, self.center_lon - perp_x * bypass_offset]
+            offset = self.width_lon * 0.25 + safe_deg
+            return [base_point[0] - perp_y * offset, base_point[1] - perp_x * offset]
 
 def load_obstacles_from_state():
     obstacles = []
@@ -478,23 +473,15 @@ with tab1:
             for obs_data in obstacles:
                 if isinstance(obs_data, dict):
                     height = obs_data['height']
+                    points = obs_data['points']
                     if flight_alt < height:
-                        obs = Obstacle.from_dict(obs_data)
-                    else:
-                        continue
+                        if line_intersects_polygon(start, end, points):
+                            return Obstacle.from_dict(obs_data)
                 else:
                     height = obs_data.height
                     if flight_alt < height:
-                        obs = obs_data
-                    else:
-                        continue
-                
-                for t in range(21):
-                    t = t/20
-                    lat = start[0] + (end[0]-start[0])*t
-                    lon = start[1] + (end[1]-start[1])*t
-                    if obs.contains([lat, lon]):
-                        return obs
+                        if line_intersects_polygon(start, end, obs_data.points):
+                            return obs_data
             return None
         
         # ========== 生成航线方案 ==========
@@ -503,7 +490,6 @@ with tab1:
             end = st.session_state.point_b
             hit = find_blocking_obstacle(start, end, st.session_state.obstacles, alt)
             
-            # 计算直线距离
             straight_dist = calc_distance(start, end)
             
             plans = []
@@ -514,11 +500,14 @@ with tab1:
                     'points': [start, end],
                     'dist': straight_dist,
                     'color': 'blue',
-                    'desc': f'✅ 直线飞行'
+                    'desc': '✅ 无障碍物阻挡'
                 })
             else:
                 # 左绕行
                 left = hit.get_bypass_point(start, end, 'left', safe_radius)
+                # 验证绕行点是否有效
+                if left[0] == start[0] and left[1] == start[1]:
+                    left = hit.get_bypass_point(start, end, 'left', safe_radius + 10)
                 left_dist = calc_distance(start, left) + calc_distance(left, end)
                 left_extra = left_dist - straight_dist
                 plans.append({
@@ -531,6 +520,8 @@ with tab1:
                 
                 # 右绕行
                 right = hit.get_bypass_point(start, end, 'right', safe_radius)
+                if right[0] == start[0] and right[1] == start[1]:
+                    right = hit.get_bypass_point(start, end, 'right', safe_radius + 10)
                 right_dist = calc_distance(start, right) + calc_distance(right, end)
                 right_extra = right_dist - straight_dist
                 plans.append({
@@ -541,17 +532,15 @@ with tab1:
                     'desc': f'从右侧绕过 (多走{right_extra:.0f}m)'
                 })
             
-            # 按距离排序找出最佳航线
-            sorted_plans = sorted(plans, key=lambda x: x['dist'])
-            best = sorted_plans[0].copy()
+            # 找出最佳航线
+            best = min(plans, key=lambda x: x['dist']).copy()
             best['name'] = '⭐ 最佳航线'
             best['color'] = 'gold'
-            best['desc'] = f'最短路径 (比另一方案少{abs(plans[0]["dist"] - plans[1]["dist"]):.0f}m)'
+            best['desc'] = f'最短路径，比另一方案节省{abs(plans[0]["dist"] - plans[1]["dist"]):.0f}m'
             plans.append(best)
             
             st.session_state.route_plans = plans
-            if plans:
-                st.session_state.selected_plan = best  # 默认选中最佳航线
+            st.session_state.selected_plan = best
             st.rerun()
         
         # ========== 显示方案 ==========
@@ -559,7 +548,6 @@ with tab1:
             st.markdown("---")
             st.markdown("### 📋 可选方案")
             
-            # 显示直线（如果有）
             for i, p in enumerate(st.session_state.route_plans):
                 col1, col2, col3 = st.columns([2, 1, 1])
                 with col1:
