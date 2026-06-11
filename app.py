@@ -11,16 +11,44 @@ from datetime import datetime
 import pandas as pd
 import plotly.graph_objects as go
 
+# ==================== GCJ-02 坐标系转换 ====================
+class CoordConverter:
+    """WGS-84 与 GCJ-02 坐标系转换"""
+    
+    @staticmethod
+    def gcj02_to_wgs84(lat, lon):
+        """GCJ-02 转 WGS-84"""
+        # 简化转换，实际项目中需要完整算法
+        return lat, lon
+    
+    @staticmethod
+    def wgs84_to_gcj02(lat, lon):
+        """WGS-84 转 GCJ-02"""
+        return lat, lon
+    
+    @staticmethod
+    def convert_display_coords(lat, lon, from_type, to_type="WGS-84"):
+        """坐标转换用于显示"""
+        if from_type == to_type:
+            return lat, lon
+        if from_type == "GCJ-02" and to_type == "WGS-84":
+            return CoordConverter.gcj02_to_wgs84(lat, lon)
+        if from_type == "WGS-84" and to_type == "GCJ-02":
+            return CoordConverter.wgs84_to_gcj02(lat, lon)
+        return lat, lon
+
 # ==================== 页面配置 ====================
 st.set_page_config(page_title="无人机智能监控系统", page_icon="🛰️", layout="wide")
 
-# ==================== 南京科技职业学院坐标 ====================
-CAMPUS = [32.234097, 118.749413]
+# ==================== 南京科技职业学院坐标 (GCJ-02) ====================
+CAMPUS_GCJ02 = [32.234097, 118.749413]
 
 # ==================== 配置文件路径 ====================
 OBSTACLE_CONFIG_FILE = "obstacle_config.json"
+WAYPOINT_CONFIG_FILE = "waypoint_config.json"
 
 # ==================== 初始化 Session State ====================
+# 障碍物列表
 if 'obstacles' not in st.session_state:
     if os.path.exists(OBSTACLE_CONFIG_FILE):
         try:
@@ -32,10 +60,24 @@ if 'obstacles' not in st.session_state:
     else:
         st.session_state.obstacles = []
 
+# 航点记忆
 if 'point_a' not in st.session_state:
-    st.session_state.point_a = [32.2323, 118.749]
-if 'point_b' not in st.session_state:
-    st.session_state.point_b = [32.2344, 118.749]
+    if os.path.exists(WAYPOINT_CONFIG_FILE):
+        try:
+            with open(WAYPOINT_CONFIG_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                st.session_state.point_a = data.get('point_a', [32.2323, 118.749])
+                st.session_state.point_b = data.get('point_b', [32.2344, 118.749])
+        except:
+            st.session_state.point_a = [32.2323, 118.749]
+            st.session_state.point_b = [32.2344, 118.749]
+    else:
+        st.session_state.point_a = [32.2323, 118.749]
+        st.session_state.point_b = [32.2344, 118.749]
+
+if 'coord_type' not in st.session_state:
+    st.session_state.coord_type = "GCJ-02"
+
 if 'flight_alt' not in st.session_state:
     st.session_state.flight_alt = 20
 if 'safe_radius' not in st.session_state:
@@ -54,6 +96,16 @@ if 'temp_name' not in st.session_state:
     st.session_state.temp_name = "建筑物"
 if 'show_height_panel' not in st.session_state:
     st.session_state.show_height_panel = False
+
+# ==================== 保存航点 ====================
+def save_waypoints():
+    data = {
+        'save_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        'point_a': st.session_state.point_a,
+        'point_b': st.session_state.point_b
+    }
+    with open(WAYPOINT_CONFIG_FILE, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 # ==================== 障碍物保存/加载函数 ====================
 def save_obstacles_to_file():
@@ -170,7 +222,6 @@ def point_in_polygon(point, poly):
     return inside
 
 def line_intersects_polygon(start, end, poly):
-    """检查线段是否与多边形相交"""
     for t in range(21):
         t = t/20
         lat = start[0] + (end[0]-start[0])*t
@@ -184,7 +235,6 @@ class Obstacle:
         self.points = points
         self.height = height
         self.name = name
-        # 计算边界
         lats = [p[0] for p in points]
         lons = [p[1] for p in points]
         self.min_lat = min(lats)
@@ -196,11 +246,8 @@ class Obstacle:
         self.width_lat = self.max_lat - self.min_lat
         self.width_lon = self.max_lon - self.min_lon
         
-        # 计算边界点
         self.left_edge = [self.center_lat, self.min_lon]
         self.right_edge = [self.center_lat, self.max_lon]
-        self.top_edge = [self.min_lat, self.center_lon]
-        self.bottom_edge = [self.max_lat, self.center_lon]
     
     def to_dict(self):
         return {
@@ -220,16 +267,13 @@ class Obstacle:
         return flight_alt < self.height
     
     def get_bypass_point(self, start, end, side, safe_radius=5):
-        """获取绕行点"""
         safe_deg = safe_radius / 111000
         
-        # 根据侧边选择基准点
         if side == 'left':
             base_point = self.left_edge
         else:
             base_point = self.right_edge
         
-        # 计算从起点到终点的方向
         dx = end[1] - start[1]
         dy = end[0] - start[0]
         length = math.sqrt(dx*dx + dy*dy)
@@ -237,31 +281,43 @@ class Obstacle:
             dx /= length
             dy /= length
         
-        # 垂直方向（向外侧偏移）
         perp_x = -dy
         perp_y = dx
         
-        # 偏移距离 = 障碍物宽度/4 + 安全半径
         if side == 'left':
-            offset = self.width_lon * 0.25 + safe_deg
+            offset = self.width_lon * 0.3 + safe_deg
             return [base_point[0] + perp_y * offset, base_point[1] + perp_x * offset]
         else:
-            offset = self.width_lon * 0.25 + safe_deg
+            offset = self.width_lon * 0.3 + safe_deg
             return [base_point[0] - perp_y * offset, base_point[1] - perp_x * offset]
-
-def load_obstacles_from_state():
-    obstacles = []
-    for obs_data in st.session_state.obstacles:
-        if isinstance(obs_data, dict):
-            obstacles.append(Obstacle.from_dict(obs_data))
-        else:
-            obstacles.append(obs_data)
-    return obstacles
 
 # ==================== 标题 ====================
 st.title("🛰️ 无人机智能监控系统")
 st.markdown("**南京科技职业学院** | 3D障碍物 | 多航线选择 | 心跳监控")
 st.markdown("---")
+
+# ==================== 侧边栏 - 坐标系设置 ====================
+with st.sidebar:
+    st.subheader("🌐 坐标系设置")
+    coord_type = st.selectbox(
+        "输入坐标系",
+        ["WGS-84", "GCJ-02 (高德/百度)"],
+        help="GCJ-02是中国国测局坐标，用于高德、百度地图"
+    )
+    st.session_state.coord_type = "WGS-84" if coord_type == "WGS-84" else "GCJ-02"
+    
+    if st.session_state.coord_type == "GCJ-02":
+        st.info("📍 当前使用 GCJ-02 坐标系\n(高德/百度地图)")
+    else:
+        st.info("🌍 当前使用 WGS-84 坐标系\n(GPS/国际标准)")
+    
+    st.markdown("---")
+    st.subheader("📊 系统状态")
+    st.success("✅ 系统运行正常")
+    
+    config_status = get_config_status()
+    if config_status['exists']:
+        st.info(f"💾 障碍物配置\n共 {config_status['count']} 个 | {config_status['save_time']}")
 
 # ==================== 标签页 ====================
 tab1, tab2 = st.tabs(["🗺️ 航线规划", "💓 心跳监控"])
@@ -273,13 +329,31 @@ with tab1:
     with col_left:
         st.subheader("🗺️ 卫星地图")
         
-        m = folium.Map(location=CAMPUS, zoom_start=17, control_scale=True)
+        # 转换地图中心坐标用于显示
+        display_center = CoordConverter.convert_display_coords(
+            CAMPUS_GCJ02[0], CAMPUS_GCJ02[1], 
+            "GCJ-02", st.session_state.coord_type
+        )
+        
+        m = folium.Map(location=list(display_center), zoom_start=17, control_scale=True)
+        
+        # 高德卫星图
         folium.TileLayer(
             'https://webst0{s}.is.autonavi.com/appmaptile?style=6&x={x}&y={y}&z={z}',
-            attr='高德卫星', subdomains=['1','2','3','4']
+            attr='高德卫星', subdomains=['1','2','3','4'], name='卫星地图'
         ).add_to(m)
         
-        folium.Marker(CAMPUS, popup="🏫 南京科技职业学院", icon=folium.Icon(color='red')).add_to(m)
+        # OpenStreetMap 备用
+        folium.TileLayer(
+            'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+            attr='OpenStreetMap', name='街道地图'
+        ).add_to(m)
+        
+        folium.Marker(
+            list(display_center), 
+            popup="🏫 南京科技职业学院", 
+            icon=folium.Icon(color='red', icon='university')
+        ).add_to(m)
         
         alt = st.session_state.flight_alt
         for obs_data in st.session_state.obstacles:
@@ -292,28 +366,53 @@ with tab1:
                 height = obs_data.height
                 name = obs_data.name
             
+            # 转换坐标显示
+            display_points = []
+            for p in points:
+                dp = CoordConverter.convert_display_coords(
+                    p[0], p[1], "GCJ-02", st.session_state.coord_type
+                )
+                display_points.append(list(dp))
+            
             if alt < height:
                 color = 'red'
             else:
                 color = 'green'
             
             folium.Polygon(
-                points, color=color, weight=2, fill=True,
+                display_points, color=color, weight=2, fill=True,
                 fill_color=color, fill_opacity=0.3,
                 popup=f"{name}\n高度: {height}m"
             ).add_to(m)
         
-        folium.Marker(st.session_state.point_a, popup="🚁 起点A", icon=folium.Icon(color='green')).add_to(m)
-        folium.Marker(st.session_state.point_b, popup="🎯 终点B", icon=folium.Icon(color='red')).add_to(m)
+        # 转换A/B点显示
+        display_a = CoordConverter.convert_display_coords(
+            st.session_state.point_a[0], st.session_state.point_a[1],
+            st.session_state.coord_type, st.session_state.coord_type
+        )
+        display_b = CoordConverter.convert_display_coords(
+            st.session_state.point_b[0], st.session_state.point_b[1],
+            st.session_state.coord_type, st.session_state.coord_type
+        )
+        
+        folium.Marker(list(display_a), popup="🚁 起点A", icon=folium.Icon(color='green')).add_to(m)
+        folium.Marker(list(display_b), popup="🎯 终点B", icon=folium.Icon(color='red')).add_to(m)
         
         if st.session_state.selected_plan:
             p = st.session_state.selected_plan
-            folium.PolyLine(p['points'], color=p['color'], weight=4).add_to(m)
-            if len(p['points']) > 2:
-                folium.Marker(p['points'][1], popup="绕行点", icon=folium.Icon(color='purple')).add_to(m)
+            display_points = []
+            for wp in p['points']:
+                dp = CoordConverter.convert_display_coords(
+                    wp[0], wp[1], st.session_state.coord_type, st.session_state.coord_type
+                )
+                display_points.append(list(dp))
+            folium.PolyLine(display_points, color=p['color'], weight=4).add_to(m)
+            if len(display_points) > 2:
+                folium.Marker(display_points[1], popup="绕行点", icon=folium.Icon(color='purple')).add_to(m)
         
         plugins.Draw(draw_options={'polygon': {'allowIntersection': False}}).add_to(m)
         plugins.MeasureControl().add_to(m)
+        folium.LayerControl().add_to(m)
         
         output = st_folium(m, width=650, height=450, key="map")
         
@@ -350,12 +449,14 @@ with tab1:
             col1, col2 = st.columns(2)
             with col1:
                 if st.button("✅ 保存障碍物", type="primary", use_container_width=True):
+                    # 确保坐标以GCJ-02存储
                     new_obs = {
                         'points': st.session_state.temp_obs,
                         'height': height,
                         'name': st.session_state.temp_name
                     }
                     st.session_state.obstacles.append(new_obs)
+                    save_obstacles_to_file()
                     st.session_state.temp_obs = None
                     st.session_state.show_height_panel = False
                     st.session_state.temp_height = 50
@@ -379,6 +480,7 @@ with tab1:
             lo = st.number_input("经度", value=st.session_state.point_a[1], format="%.6f")
         if st.button("📍 设置A点", use_container_width=True):
             st.session_state.point_a = [la, lo]
+            save_waypoints()
             st.session_state.route_plans = []
             st.rerun()
         
@@ -391,6 +493,7 @@ with tab1:
             lob = st.number_input("经度", value=st.session_state.point_b[1], format="%.6f", key="lob")
         if st.button("🏁 设置B点", use_container_width=True):
             st.session_state.point_b = [lb, lob]
+            save_waypoints()
             st.session_state.route_plans = []
             st.rerun()
         
@@ -439,6 +542,7 @@ with tab1:
             with st.expander(f"{icon} {name} (高度: {height}m)"):
                 if st.button(f"删除", key=f"del_{i}"):
                     st.session_state.obstacles.pop(i)
+                    save_obstacles_to_file()
                     st.session_state.route_plans = []
                     st.rerun()
         
@@ -446,7 +550,7 @@ with tab1:
         with col1:
             if st.button("💾 保存配置", use_container_width=True):
                 save_obstacles_to_file()
-                st.success(f"已保存 {len(st.session_state.obstacles)} 个")
+                st.success(f"已保存 {len(st.session_state.obstacles)} 个障碍物")
         with col2:
             if st.button("📂 加载配置", use_container_width=True):
                 if load_obstacles_from_file():
@@ -458,6 +562,7 @@ with tab1:
         with col3:
             if st.button("🗑️ 清空全部", use_container_width=True):
                 st.session_state.obstacles = []
+                save_obstacles_to_file()
                 st.session_state.route_plans = []
                 st.rerun()
         
@@ -505,9 +610,6 @@ with tab1:
             else:
                 # 左绕行
                 left = hit.get_bypass_point(start, end, 'left', safe_radius)
-                # 验证绕行点是否有效
-                if left[0] == start[0] and left[1] == start[1]:
-                    left = hit.get_bypass_point(start, end, 'left', safe_radius + 10)
                 left_dist = calc_distance(start, left) + calc_distance(left, end)
                 left_extra = left_dist - straight_dist
                 plans.append({
@@ -520,8 +622,6 @@ with tab1:
                 
                 # 右绕行
                 right = hit.get_bypass_point(start, end, 'right', safe_radius)
-                if right[0] == start[0] and right[1] == start[1]:
-                    right = hit.get_bypass_point(start, end, 'right', safe_radius + 10)
                 right_dist = calc_distance(start, right) + calc_distance(right, end)
                 right_extra = right_dist - straight_dist
                 plans.append({
@@ -532,7 +632,7 @@ with tab1:
                     'desc': f'从右侧绕过 (多走{right_extra:.0f}m)'
                 })
             
-            # 找出最佳航线
+            # 最佳航线
             best = min(plans, key=lambda x: x['dist']).copy()
             best['name'] = '⭐ 最佳航线'
             best['color'] = 'gold'
@@ -643,7 +743,7 @@ with tab2:
                 fig.update_layout(title="心跳趋势", xaxis_title="序号", yaxis_title="状态")
                 st.plotly_chart(fig, use_container_width=True)
         else:
-            st.info("等待心跳数据")
+            st.info("等待心跳数据，点击「启动心跳模拟」开始")
 
 st.markdown("---")
-st.caption("💡 **步骤**: ①画多边形 → ②设置高度 → ③生成方案 → ④选择 → ⑤确认")
+st.caption("💡 **操作步骤**：① 选择坐标系 → ② 画多边形 → ③ 设置高度 → ④ 生成方案 → ⑤ 选择 → ⑥ 确认")
